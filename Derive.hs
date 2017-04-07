@@ -1,6 +1,6 @@
 {-# Language
      TypeFamilies, GADTs, DataKinds, ConstraintKinds, RankNTypes,
-     TypeOperators, ScopedTypeVariables, KindSignatures,
+     TypeOperators, ScopedTypeVariables, KindSignatures, InstanceSigs,
      FlexibleContexts, FlexibleInstances, MultiParamTypeClasses,
      AllowAmbiguousTypes, TypeApplications
   #-}
@@ -19,14 +19,9 @@ module Derive
   , NatVal(..)
   , KnownNat(..)
 
-  -- * Length-indexed vectors
-  , V(..)
-
   -- * N-ary functions
   , FunN(..)
   , Op
-  , curryN
-  , uncurryN
 
   -- * Generic operator lifting
   , GOpN(..)
@@ -55,51 +50,38 @@ instance KnownNat n => KnownNat ('S n) where knownNat = IsS knownNat
 
 ------------------------------------------------------------------------
 
--- | Vectors indexed by their lengths.
-data V n a where
-  Nil  ::               V 'Z a
-  Cons :: a -> V n a -> V ('S n) a
-
-instance Functor (V n) where
-  fmap _ Nil         = Nil
-  fmap f (Cons x xs) = Cons (f x) (fmap f xs)
-
-------------------------------------------------------------------------
-
 -- | N-ary function taking @n@ arguments of type @a@ to produce @b@.
-newtype FunN n a b = FunN { ($$) :: V n a -> b }
+newtype FunN n a b = FunN { runFunN :: Op n a b }
 
-infixl 9 $$
-
-instance Profunctor (FunN n) where
-  dimap f g (FunN h) = FunN (g . h . fmap f)
-
--- | /Reader/-like behavior
-instance Functor (FunN n e) where fmap = liftM
-
--- | /Reader/-like behavior
-instance Applicative (FunN n e) where
-  pure  = FunN . const
-  (<*>) = ap
+instance KnownNat n => Profunctor (FunN n) where
+  dimap :: forall a b c d. (a -> b) -> (c -> d) -> FunN n b c -> FunN n a d
+  dimap ab cd (FunN bc) = FunN (go (knownNat @n) bc)
+    where
+      go :: NatVal m -> Op m b c -> Op m a d
+      go IsZ     x = cd x
+      go (IsS m) x = go m . x . ab
 
 -- | /Reader/-like behavior
-instance Monad (FunN n e) where
-  m >>= f = FunN (\x -> f (m $$ x) $$ x)
+instance KnownNat n => Functor (FunN n e) where
+  fmap = liftA
+
+-- | /Reader/-like behavior
+instance KnownNat n => Applicative (FunN n e) where
+  pure :: forall a. a -> FunN n e a
+  pure x = FunN (go (knownNat @n))
+    where
+      go :: NatVal m -> Op m e a
+      go IsZ     = x
+      go (IsS m) = \_ -> go m
+
+  (<*>) :: forall a b. FunN n e (a -> b) -> FunN n e a -> FunN n e b
+  FunN ff <*> FunN fx = FunN (go (knownNat @n) ff fx)
+    where
+      go :: NatVal m -> Op m e (a -> b) -> Op m e a -> Op m e b
+      go IsZ     = id
+      go (IsS m) = liftA2 (go m)
 
 ------------------------------------------------------------------------
-
--- | N-ary 'uncurry'.
-uncurryN :: Op n a b -> V n a -> b
-uncurryN x Nil         = x
-uncurryN f (Cons x xs) = uncurryN (f x) xs
-
--- | N-ary 'curry'.
-curryN :: forall n a b. KnownNat n => (V n a -> b) -> Op n a b
-curryN = go (knownNat @n)
-  where
-    go :: forall m. NatVal m -> (V m a -> b) -> Op m a b
-    go IsZ     f = f Nil
-    go (IsS n) f = \x -> go n (f . Cons x)
 
 -- | Family of N-ary operator types.
 type family Op n a b where
@@ -113,7 +95,7 @@ type family Op n a b where
 -- product type.
 class GOpN c f where
   -- | Lift a polymorphic operator constrained by a typeclass @c@.
-  liftOpN :: (forall a. c a => FunN n a a) -> FunN n (f p) (f p)
+  liftOpN :: KnownNat n => (forall a. c a => FunN n a a) -> FunN n (f p) (f p)
 
 -- | Metadata
 instance GOpN c f => GOpN c (M1 i d f) where
@@ -142,10 +124,9 @@ genericOpN ::
   (forall b. c b => Op n b b) {- ^ polymorphic n-ary operator -} ->
   Op n a a                    {- ^ lifted n-ary operator      -}
 genericOpN f =
-  curryN @n @a @a $ \xs ->
-    dimap from to
-      (liftOpN @c (FunN (uncurryN (f @z) :: forall z. c z => V n z -> z)))
-    $$ xs
+  runFunN @n @a @a
+    $ dimap from to
+    $ liftOpN @c (FunN (f @z) :: forall z. c z => FunN n z z)
 
 ------------------------------------------------------------------------
 
